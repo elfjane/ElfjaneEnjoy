@@ -1,0 +1,7 @@
+﻿{
+    "name": "Enjoy",
+    "version_number": "1.0.0",
+    "website_url": "https://github.com/oscarpedrero/ElfjaneEnjoy",
+    "description": "A mod that notifies when a user connects or disconnects from the server, new user connect from the server, when a player kills a VBlood boss, Message of the day system and auto announce system that runs every certain interval.",
+    "dependencies": ["BepInEx-BepInExPack_V_Rising-1.668.5", "deca-VampireCommandFramework-0.9.0", "Trodi-BloodyCore-1.2.2"]
+}
