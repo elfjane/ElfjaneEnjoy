@@ -4,9 +4,6 @@ using ElfjaneEnjoy.DB;
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.IO;
-using System.Text.Json;
-using System.Threading.Tasks;
 using VampireCommandFramework;
 using ProjectM;
 using Unity.Collections;
@@ -16,258 +13,282 @@ using ProjectM.Scripting;
 using Bloody.Core;
 using Bloody.Core.GameData.v1;
 
-
 namespace ElfjaneEnjoy.MiniGame
 {
     public class MiniGameFunction
     {
         private static readonly Random _rnd = new Random();
+
         private static bool _active = false;
+        private static bool _waitingForTimeout = false;
+
         private static int _answer = 0;
         private static string _answerWord = null;
         private static bool _isWordGame = false;
+
         private static List<WordEntry> _wordList = null;
+
         private static string _question = "";
         private static int _level = 1;
         private static string _winner = null;
+
         private static int _timeLimitSeconds = 30;
 
+        // ✅ Server-safe time (seconds since epoch)
+        private static double _roundEndTime;
+
+        private static bool _hint10Sent = false;
+        private static bool _hint5Sent = false;
+
+
+        // =============================
+        // Entry
+        // =============================
         public static void StartMiniGame()
         {
             static void MiniGameAction()
             {
-                if (Database.EnabledFeatures.ContainsKey(NotifyFeature.minigame) && Database.EnabledFeatures[NotifyFeature.minigame])
+                TickMiniGame();
+
+                if (Database.EnabledFeatures.TryGetValue(NotifyFeature.minigame, out var enabled)
+                    && enabled)
                 {
                     if (!_active)
                     {
-                        // 隨機選擇一個遊戲
                         if (_rnd.Next(0, 2) == 0)
-                            StartRound();      // 算術題
+                            StartRound();
                         else
-                            StartWordRound();  // 單字填空
+                            StartWordRound();
                     }
                 }
             }
 
-            CoroutineHandler.StartRepeatingCoroutine(MiniGameAction, Math.Max(10, Database.getIntervalMiniGame()));
+            CoroutineHandler.StartRepeatingCoroutine(
+                MiniGameAction,
+                Math.Max(10, Database.getIntervalMiniGame())
+            );
         }
 
+        // =============================
+        // Math Round
+        // =============================
         private static void StartRound()
         {
-            // generate a simple 1~2 digit math question
             int a, b;
-            int op = _rnd.Next(0, 4); // 0:+ 1:- 2:*
+            int op = _rnd.Next(0, 4);
 
             switch (op)
             {
-                case 0: // 加法
-                    a = _rnd.Next(1, 10); // 1-99
+                case 0:
+                    a = _rnd.Next(1, 10);
                     b = _rnd.Next(1, 10);
                     _question = $"{a} + {b}";
                     _answer = a + b;
                     _level = 1;
                     break;
-                case 1: // 減法
+
+                case 1:
                     b = _rnd.Next(1, 10);
-                    a = _rnd.Next(b, 11); // a >= b
+                    a = _rnd.Next(b, 11);
                     _question = $"{a} - {b}";
                     _answer = a - b;
                     _level = 1;
                     break;
-                case 2: // 加法 (兩位數)
-                    a = _rnd.Next(1, 100); // 1-99
+
+                case 2:
+                    a = _rnd.Next(1, 100);
                     b = _rnd.Next(1, 100);
                     _question = $"{a} + {b}";
-                    _answer = a - b;
+                    _answer = a + b;
                     _level = 2;
                     break;
-                case 3: // 減法 (兩位數)
+
+                case 3:
                     b = _rnd.Next(1, 100);
-                    a = _rnd.Next(b, 101); // a >= b
+                    a = _rnd.Next(b, 101);
                     _question = $"{a} - {b}";
                     _answer = a - b;
                     _level = 2;
                     break;
-                default: // 乘法
-                    a = _rnd.Next(1, 10); // 1-99
-                    b = _rnd.Next(1, 10);
-                    _question = $"{a} * {b}";
-                    _answer = a * b;
-                    _level = 5;
-                    break;
             }
 
             _active = true;
+            _waitingForTimeout = true;
+            _winner = null;
+            _isWordGame = false;
+
+            StartTimeout();
+
+            SendGreen($"[MiniGame] 題目: {_question} = ?");
+            SendGreen($"回答請使用: .ans <數字>");
+        }
+
+        // =============================
+        // Word Round
+        // =============================
+        private static void StartWordRound()
+        {
+            EnsureWordListLoaded();
+            if (_wordList.Count == 0) return;
+
+            var entry = _wordList[_rnd.Next(_wordList.Count)];
+            _answerWord = entry.en.Trim();
+            _isWordGame = true;
+            _active = true;
+            _waitingForTimeout = true;
             _winner = null;
 
-            var line1 = (FixedString512Bytes)$"[MiniGame] 題目: {_question} = ? (第一個答對者得獎)";
-            var line2 = (FixedString512Bytes)$"回答請使用: .elf ans <數字>";
+            StartTimeout();
 
-            ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line1);
-            ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line2);
+            var masked = MaskWord(_answerWord);
 
-            // start timeout
-            _ = EndRoundAfterTimeoutAsync(_timeLimitSeconds);
+            SendGreen($"[MiniGame-單字] 中文意思: {entry.zh}");
+            SendGreen($"填入缺失的英文: {masked}");
+            SendGreen($"回答請使用: .eng <英文>");
         }
 
-        private static async Task EndRoundAfterTimeoutAsync(int seconds)
-        {
-            await Task.Delay(seconds * 1000);
-
-            if (_active && _winner == null)
-            {
-                _active = false;
-                if (_isWordGame)
-                {
-                    var line = (FixedString512Bytes)$"[MiniGame-單字] 時間到，沒有人答對。答案是 {_answerWord}.";
-                    ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line);
-                    _isWordGame = false;
-                    _answerWord = null;
-                }
-                else
-                {
-                    var line = (FixedString512Bytes)$"[MiniGame] 時間到，沒有人答對。答案是 {_answer}.";
-                    ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line);
-                }
-            }
-        }
-
+        // =============================
+        // Answer
+        // =============================
         public static bool TryAnswer(ChatCommandContext ctx, int ans)
         {
-            if (!_active) return false;
+            if (!_active || !_waitingForTimeout || _winner != null)
+                return false;
 
-            if (_winner != null) return false;
+            if (ans != _answer)
+                return false;
 
-            if (ans == _answer)
-            {
-                Entity playerEntity = ctx.Event.SenderCharacterEntity;
-                string playerName = GetPlayerNameFromContext(playerEntity);
-                _winner = playerName ?? "Unknown";
-                _active = false;
-
-                var line = (FixedString512Bytes)$"[MiniGame] 恭喜 {_winner} 答對了! 答案是 {_answer}.";
-                ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line);
-
-                // grant reward (best-effort)
-
-                GrantRewardToWinner(playerEntity, playerName);
-
-                return true;
-            }
-
-            return false;
+            HandleWinner(ctx.Event.SenderCharacterEntity, ans.ToString());
+            return true;
         }
 
         public static bool TryEnglishAnswer(ChatCommandContext ctx, string ans)
         {
-            if (!_active) return false;
+            if (!_active || !_isWordGame || _winner != null)
+                return false;
 
-            if (_winner != null) return false;
+            if (!string.Equals(ans?.Trim(), _answerWord, StringComparison.OrdinalIgnoreCase))
+                return false;
 
-            if (!_isWordGame) return false;
+            HandleWinner(ctx.Event.SenderCharacterEntity, _answerWord);
+            return true;
+        }
 
-            if (string.Equals(ans?.Trim(), _answerWord, StringComparison.OrdinalIgnoreCase))
+        // =============================
+        // Timeout Tick (Server-safe)
+        // =============================
+        private static void TickMiniGame()
+        {
+            if (!_waitingForTimeout)
+                return;
+
+            double now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond;
+            double remain = _roundEndTime - now;
+
+            // ===== 倒數提示 =====
+            if (!_hint10Sent && remain <= 10 && remain > 5)
             {
-                Entity playerEntity = ctx.Event.SenderCharacterEntity;
-                string playerName = GetPlayerNameFromContext(playerEntity);
-                _winner = playerName ?? "Unknown";
-                _active = false;
-
-                var line = (FixedString512Bytes)$"[MiniGame-單字] 恭喜 {_winner} 答對了! 答案是 {_answerWord}.";
-                ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line);
-
-                GrantRewardToWinner(playerEntity, playerName);
-
-                _isWordGame = false;
-                _answerWord = null;
-
-                return true;
+                _hint10Sent = true;
+                SendGreen($"[MiniGame] ⏰ 剩下 10 秒！");
             }
 
-            return false;
+            if (!_hint5Sent && remain <= 5 && remain > 0)
+            {
+                _hint5Sent = true;
+                SendGreen($"[MiniGame] ⏰ 剩下 5 秒！");
+            }
+
+            // ===== 還沒結束 =====
+            if (remain > 0)
+                return;
+
+            // ===== 時間到 =====
+            _waitingForTimeout = false;
+
+            if (!_active || _winner != null)
+                return;
+
+            _active = false;
+
+            if (_isWordGame)
+            {
+                SendGreen($"[MiniGame-單字] ⌛ 時間到，答案是 {_answerWord}");
+
+                _answerWord = null;
+                _isWordGame = false;
+            }
+            else
+            {
+                SendGreen($"[MiniGame] ⌛ 時間到，答案是 {_answer}");
+            }
+        }
+
+        // =============================
+        // Helpers
+        // =============================
+        private static void StartTimeout()
+        {
+            double now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond;
+
+            _roundEndTime = now + _timeLimitSeconds;
+
+            _hint10Sent = false;
+            _hint5Sent = false;
+        }
+
+
+        private static void HandleWinner(Entity playerEntity, string answer)
+        {
+            _winner = GetPlayerName(playerEntity);
+            _active = false;
+            _waitingForTimeout = false;
+
+            SendGreen($"[MiniGame] 恭喜 {_winner} 答對！答案是 {answer}");
+
+            GrantRewardToWinner(playerEntity, _winner);
+        }
+
+        private static void Send(FixedString512Bytes msg)
+        {
+            ServerChatUtils.SendSystemMessageToAllClients(
+                Plugin.SystemsCore.EntityManager,
+                ref msg
+            );
+        }
+
+        private static void SendGreen(string msg)
+        {
+            FixedString512Bytes fixedString = new FixedString512Bytes(FontColorChatSystem.Green(msg));
+            ServerChatUtils.SendSystemMessageToAllClients(
+                Plugin.SystemsCore.EntityManager,
+                ref fixedString
+            );
+        }
+
+        private static string GetPlayerName(Entity playerEntity)
+        {
+            var em = Plugin.SystemsCore.EntityManager;
+            var pc = em.GetComponentData<PlayerCharacter>(playerEntity);
+            return pc.Name.ToString();
         }
 
         private static void EnsureWordListLoaded()
         {
             if (_wordList != null) return;
-
-            // Load from Database which is populated by LoadDatabase.LoadWordListConfig
-            try
-            {
-                _wordList = Database.getWordList();
-                if (_wordList == null) _wordList = new List<WordEntry>();
-            }
-            catch
-            {
-                _wordList = new List<WordEntry>();
-            }
+            _wordList = Database.getWordList() ?? new List<WordEntry>();
         }
 
         private static string MaskWord(string word)
         {
-            if (string.IsNullOrEmpty(word)) return word;
-            word = word.Trim();
-            if (word.Length <= 2) return word;
+            if (string.IsNullOrEmpty(word) || word.Length <= 2)
+                return word;
 
             var chars = word.ToCharArray();
-            for (int i = 0; i < chars.Length; i++)
-            {
-                if (i == 0 || i == chars.Length - 1) continue; // keep first and last
-                if (!char.IsLetter(chars[i])) continue;
-
-                // reveal some letters randomly (~40% chance)
-                if (_rnd.NextDouble() < 0.4)
-                {
-                    // keep
-                }
-                else
-                {
+            for (int i = 1; i < chars.Length - 1; i++)
+                if (_rnd.NextDouble() > 0.4)
                     chars[i] = '_';
-                }
-            }
 
             return new string(chars);
-        }
-
-        private static void StartWordRound()
-        {
-            EnsureWordListLoaded();
-            if (_wordList == null || _wordList.Count == 0) return;
-
-            var entry = _wordList[_rnd.Next(0, _wordList.Count)];
-            _answerWord = entry.en.Trim();
-            _isWordGame = true;
-            _active = true;
-            _winner = null;
-
-            var masked = MaskWord(_answerWord);
-
-            var line1 = (FixedString512Bytes)$"[MiniGame-單字] 中文意思: {entry.zh}";
-            var line2 = (FixedString512Bytes)$"填入缺失的英文: {masked}";
-            var line3 = (FixedString512Bytes)$"回答請使用: .elf e <英文>";
-
-            ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line1);
-            ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line2);
-            ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line3);
-
-            _ = EndRoundAfterTimeoutAsync(_timeLimitSeconds);
-        }
-
-        private static string GetPlayerNameFromContext(Entity playerEntity)
-        {
-            var entityManager = Plugin.SystemsCore.EntityManager;
-
-            if (!entityManager.HasComponent<PlayerCharacter>(playerEntity))
-            {
-                // 理論上不會發生，保險用
-                return "未知玩家";
-            }
-
-            var playerCharacter = entityManager.GetComponentData<PlayerCharacter>(playerEntity);
-
-            // 角色名稱
-            string playerName = playerCharacter.Name.ToString();
-            return playerName;
         }
 
         private static void GrantRewardToWinner(Entity playerEntity, string playerName)
@@ -277,8 +298,7 @@ namespace ElfjaneEnjoy.MiniGame
 
             if (rewardItem == 0)
             {
-                var line = (FixedString512Bytes)$"[MiniGame] 備註: 未設定獎勵物品，請管理員手動發放。";
-                ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref line);
+                SendGreen($"[MiniGame] 備註: 未設定獎勵物品，請管理員手動發放。");
                 return;
             }
 
@@ -286,13 +306,11 @@ namespace ElfjaneEnjoy.MiniGame
             // If not possible, inform admins how to give the reward manually.
 
             PrefabGUID rewardItemGuid = new PrefabGUID(rewardItem);
-            var rewardItemName = GetPrefabDisplayName(rewardItemGuid) ?? rewardItemGuid.ToString();
-            var lineAdmin = (FixedString512Bytes)$"{playerName} 答對了！獲得 水晶x{rewardAmount}。";
             //var lineUser = (FixedString512Bytes)$"你答對了！獲得 {rewardItemName}x{rewardAmount}，請查看背包。";
+            string rewardItemName = GetPrefabDisplayName(rewardItemGuid) ?? rewardItemGuid.ToString();
             GiveToUser(playerEntity, rewardItemGuid, rewardAmount);
-            ServerChatUtils.SendSystemMessageToAllClients(Plugin.SystemsCore.EntityManager, ref lineAdmin);
+            SendGreen($"{playerName} 答對了！獲得 水晶x{rewardAmount}。");
         }
-
         private static string GetPrefabDisplayName(PrefabGUID guid)
         {
             try
@@ -330,7 +348,15 @@ namespace ElfjaneEnjoy.MiniGame
 
             return null;
         }
+        public static void GiveItem(Entity playerEntity, PrefabGUID itemGuid, int amount)
+        {
+            UserSystem.TryAddInventoryItemOrDrop(playerEntity, itemGuid, amount);
 
+        }
+        public static void GiveToUser(Entity userEntity, PrefabGUID itemGuid, int amount)
+        {
+            GiveItem(userEntity, itemGuid, amount);
+        }
         // Admin helper to force start a round
         public static void ForceStart()
         {
@@ -347,16 +373,5 @@ namespace ElfjaneEnjoy.MiniGame
                 StartWordRound();
             }
         }
-
-        public static void GiveItem(Entity playerEntity, PrefabGUID itemGuid, int amount)
-        {
-            UserSystem.TryAddInventoryItemOrDrop(playerEntity, itemGuid, amount);
-
-        }
-        public static void GiveToUser(Entity userEntity, PrefabGUID itemGuid, int amount)
-        {
-            GiveItem(userEntity, itemGuid, amount);
-        }
-
     }
 }
